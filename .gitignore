@@ -2,3 +2,18 @@ bin
 *.swp
 build/
 experimentlogs/*
+
+# Results / outputs
+runs/
+analysis_plots/
+analysis_epoch_glyphs.csv
+interaction_master.out
+
+# Python
+__pycache__/
+venv/
+
+# Temporary / experiments
+random_partner_test.cc
+test.sh
+

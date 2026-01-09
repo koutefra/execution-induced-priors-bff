@@ -44,6 +44,8 @@ PYBIND11_MODULE(cubff, m) {
       .def_readwrite("permute_programs", &SimulationParams::permute_programs)
       .def_readwrite("fixed_shuffle", &SimulationParams::fixed_shuffle)
       .def_readwrite("zero_init", &SimulationParams::zero_init)
+      .def_readwrite("random_partner_interaction",
+                     &SimulationParams::random_partner_interaction)
       .def_readwrite("allowed_interactions",
                      &SimulationParams::allowed_interactions)
       .def_readwrite("eval_selfrep", &SimulationParams::eval_selfrep)

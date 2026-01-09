@@ -68,6 +68,9 @@ struct SimulationParams {
   bool fixed_shuffle = false;
   bool zero_init = false;
   bool eval_selfrep = false;
+  bool reinit_each_epoch = false;
+  bool print_selfrep = false;
+  bool random_partner_interaction = false;
   std::vector<std::vector<uint32_t>> allowed_interactions;
 };
 
