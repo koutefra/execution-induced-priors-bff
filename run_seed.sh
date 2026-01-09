@@ -1,0 +1,47 @@
+#!/bin/bash
+set -e
+
+MODE=$1       # "reinit", "interaction", or "random"
+SEED=$2       # integer
+
+# Valid compute GPUs on your DGX (skip GPU 3 – it's display)
+GPUS=(0 1 2 4)
+GPU_ID=${GPUS[$(( SEED % 4 ))]}
+
+export CUDA_VISIBLE_DEVICES=$GPU_ID
+
+OUTDIR="runs/${MODE}"
+mkdir -p "$OUTDIR"
+
+STDOUT="${OUTDIR}/out_${SEED}.log"
+LOGFILE="${OUTDIR}/log_${SEED}.log"
+STDERR="${OUTDIR}/err_${SEED}.log"
+
+echo "[${MODE}] seed ${SEED} → GPU ${GPU_ID}"
+
+if [ "$MODE" = "reinit" ]; then
+    bin/main --lang bff_noheads --num 131072 \
+        --reinit_each_epoch --eval_selfrep --print_selfrep \
+        --print_interval 1 --log_interval 1 --max_epochs 16000 \
+        --disable_output --seed "${SEED}" \
+        --log "$LOGFILE" \
+        > "$STDOUT" 2> "$STDERR"
+elif [ "$MODE" = "interaction" ]; then
+    bin/main --lang bff_noheads --num 131072 \
+        --eval_selfrep --print_selfrep \
+        --print_interval 512 --log_interval 1 --max_epochs 16000 \
+        --mutation_prob 0.00024 --seed "${SEED}" \
+        --log "$LOGFILE" \
+        > "$STDOUT" 2> "$STDERR"
+elif [ "$MODE" = "random" ]; then
+    bin/main --lang bff_noheads --num 131072 \
+        --eval_selfrep --print_selfrep \
+        --print_interval 512 --log_interval 1 --max_epochs 16000 \
+        --mutation_prob 0.00024 --random_partner_interaction \
+        --seed "${SEED}" \
+        --log "$LOGFILE" \
+        > "$STDOUT" 2> "$STDERR"
+else
+    echo "Unknown mode: $MODE"
+    exit 1log_interval 1 --
+fi

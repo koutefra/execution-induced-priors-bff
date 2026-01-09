@@ -193,6 +193,69 @@ __global__ void MutateAndRunPrograms(uint8_t *programs,
 }
 
 template <typename Language>
+__global__ void MutateAndRunProgramsRandomPartner(
+    uint8_t *programs, size_t seed, size_t epoch, uint32_t mutation_prob,
+    unsigned long long *insn_count, size_t num_programs) {
+  size_t index = GetIndex();
+  if (index >= num_programs) return;
+
+  uint8_t tape[2 * kSingleTapeSize] = {};
+  uint8_t random_prog[kSingleTapeSize] = {};
+
+  const uint8_t *program_a = programs + index * kSingleTapeSize;
+
+  // --- Construct a strong base seed from (global seed, epoch) ---
+  uint64_t base_seed =
+      SplitMix64(SplitMix64((uint64_t)seed) ^ SplitMix64((uint64_t)epoch));
+
+  // --- Stream 1: random partner bytes (depends on index, but independent of mutation) ---
+  uint64_t partner_seed =
+      SplitMix64(base_seed ^ SplitMix64((uint64_t)index));
+
+  for (size_t i = 0; i < kSingleTapeSize; ++i) {
+    uint64_t x = SplitMix64(partner_seed + i);
+    random_prog[i] = x & 0xFF;
+  }
+
+  // Decide whether A is first or second using a separate bit from the same stream
+  bool a_first =
+      (SplitMix64(partner_seed ^ 0x9e3779b97f4a7c15ULL) & 1ULL) == 0ULL;
+  size_t a_offset = a_first ? 0 : kSingleTapeSize;
+  uint8_t *a_half = tape + a_offset;
+  uint8_t *r_half = tape + (a_first ? kSingleTapeSize : 0);
+
+  for (size_t i = 0; i < kSingleTapeSize; ++i) {
+    a_half[i] = program_a[i];
+    r_half[i] = random_prog[i];
+  }
+
+  // --- Stream 2: mutation RNG (separate from partner_seed) ---
+  uint64_t mutation_seed =
+      SplitMix64(base_seed ^ 0x6a09e667f3bcc909ULL);  // different constant
+
+  for (size_t i = 0; i < 2 * kSingleTapeSize; ++i) {
+    // Mix index and position into the mutation stream
+    uint64_t x = SplitMix64(mutation_seed ^
+                            ((uint64_t)index << 32) ^ (uint64_t)i);
+    uint8_t repl = x & 0xFF;
+    uint64_t prob_rng = (x >> 8) & ((1ULL << 30) - 1);
+    if (prob_rng < mutation_prob) {
+      tape[i] = repl;
+    }
+  }
+
+  bool debug = false;
+  size_t ops = Language::Evaluate(tape, 8 * 1024, debug);
+
+  for (size_t i = 0; i < kSingleTapeSize; ++i) {
+    programs[index * kSingleTapeSize + i] = tape[a_offset + i];
+  }
+
+  IncreaseInsnCount(ops, insn_count);
+}
+
+
+template <typename Language>
 __global__ void RunOneProgram(uint8_t *program, size_t stepcount, bool debug) {
   size_t ops = Language::Evaluate(program, stepcount, debug);
   printf("%s", ResetColors());
@@ -362,7 +425,9 @@ void Simulation<Language>::RunSimulation(
   DeviceMemory<uint8_t> programs(kSingleTapeSize * num_programs);
   DeviceMemory<unsigned long long> insn_count(1);
 
-  CHECK(num_programs % 2 == 0);
+  if (!params.reinit_each_epoch && !params.random_partner_interaction) {
+    CHECK(num_programs % 2 == 0);
+  }
 
   auto seed = [&](size_t seed2) {
     return SplitMix64(SplitMix64(params.seed) ^ SplitMix64(seed2));
@@ -430,68 +495,83 @@ void Simulation<Language>::RunSimulation(
   auto start = std::chrono::high_resolution_clock::now();
   auto simulation_start = std::chrono::high_resolution_clock::now();
   for (;; epoch++) {
-    size_t num_indices = num_programs / 2;
-    // Shuffle indices.
-    if (!params.allowed_interactions.empty()) {
-      for (size_t i = 0; i < num_programs; i++) {
-        shuffle_tmp_buf[i] = i;
-        used_program[i] = false;
-      }
-      do_shuffle(shuffle_tmp_buf.data(),
-                 shuffle_tmp_buf.data() + shuffle_tmp_buf.size(), epoch);
-      num_indices = 0;
-      for (size_t i : shuffle_tmp_buf) {
-        auto &interact = params.allowed_interactions;
-        if (interact.size() <= i || interact[i].empty()) {
-          continue;
-        }
-        size_t idx = seed(seed(epoch) ^ seed(i)) % interact[i].size();
-        size_t neigh = interact[i][idx];
-        if (used_program[i] || used_program[neigh]) {
-          continue;
-        }
-        used_program[i] = used_program[neigh] = true;
-        s[num_indices * 2] = i;
-        s[num_indices * 2 + 1] = neigh;
-        num_indices++;
-      }
-      size_t idx = num_indices * 2;
-      for (size_t i = 0; i < num_programs; i++) {
-        if (!used_program[i]) {
-          s[idx++] = i;
-        }
-      }
-    } else if (params.permute_programs) {
-      for (size_t i = 0; i < num_programs; i++) {
-        s[i] = i;
-      }
-      if (params.fixed_shuffle) {
-        size_t flip = epoch & 1;
-        size_t max_pow2 = 31 - __builtin_clz(num_programs);
-        size_t offset = (1 << (epoch % max_pow2 + 1)) - 1;
-        for (size_t i = 0; i < num_programs; i++) {
-          s[i] = ((i * offset) % num_programs) ^ flip;
-        }
+    if (!params.reinit_each_epoch) {
+      if (params.random_partner_interaction) {
+        RUN((num_programs + kNumThreads - 1) / kNumThreads, kNumThreads,
+            MutateAndRunProgramsRandomPartner<Language>, programs.Get(),
+            params.seed, epoch, params.mutation_prob, insn_count.Get(),
+            num_programs);
+        num_runs += num_programs;
       } else {
-        do_shuffle(s.data(), s.data() + s.size(), epoch);
-      }
-    } else if (epoch % 2 == 1) {
-      for (size_t i = 0; i < num_programs; i++) {
-        s[i] = i;
+        size_t num_indices = num_programs / 2;
+        // Shuffle indices.
+        if (!params.allowed_interactions.empty()) {
+          for (size_t i = 0; i < num_programs; i++) {
+            shuffle_tmp_buf[i] = i;
+            used_program[i] = false;
+          }
+          do_shuffle(shuffle_tmp_buf.data(),
+                     shuffle_tmp_buf.data() + shuffle_tmp_buf.size(), epoch);
+          num_indices = 0;
+          for (size_t i : shuffle_tmp_buf) {
+            auto &interact = params.allowed_interactions;
+            if (interact.size() <= i || interact[i].empty()) {
+              continue;
+            }
+            size_t idx = seed(seed(epoch) ^ seed(i)) % interact[i].size();
+            size_t neigh = interact[i][idx];
+            if (used_program[i] || used_program[neigh]) {
+              continue;
+            }
+            used_program[i] = used_program[neigh] = true;
+            s[num_indices * 2] = i;
+            s[num_indices * 2 + 1] = neigh;
+            num_indices++;
+          }
+          size_t idx = num_indices * 2;
+          for (size_t i = 0; i < num_programs; i++) {
+            if (!used_program[i]) {
+              s[idx++] = i;
+            }
+          }
+        } else if (params.permute_programs) {
+          for (size_t i = 0; i < num_programs; i++) {
+            s[i] = i;
+          }
+          if (params.fixed_shuffle) {
+            size_t flip = epoch & 1;
+            size_t max_pow2 = 31 - __builtin_clz(num_programs);
+            size_t offset = (1 << (epoch % max_pow2 + 1)) - 1;
+            for (size_t i = 0; i < num_programs; i++) {
+              s[i] = ((i * offset) % num_programs) ^ flip;
+            }
+          } else {
+            do_shuffle(s.data(), s.data() + s.size(), epoch);
+          }
+        } else if (epoch % 2 == 1) {
+          for (size_t i = 0; i < num_programs; i++) {
+            s[i] = i;
+          }
+        } else {
+          for (size_t i = 0; i < num_programs; i++) {
+            s[i] = i == 0 ? num_programs - 1 : i - 1;
+          }
+        }
+
+        shuf_idx.Write(s.data(), num_programs);
+
+        RUN((num_programs + 2 * kNumThreads - 1) / (2 * kNumThreads),
+            kNumThreads, MutateAndRunPrograms<Language>, programs.Get(),
+            shuf_idx.Get(), seed(epoch), params.mutation_prob,
+            insn_count.Get(), num_programs, num_indices);
+        num_runs += num_indices;
       }
     } else {
-      for (size_t i = 0; i < num_programs; i++) {
-        s[i] = i == 0 ? num_programs - 1 : i - 1;
-      }
+      RUN((num_programs + kNumThreads - 1) / kNumThreads, kNumThreads,
+          InitPrograms<Language>, seed(reset_index), num_programs,
+          programs.Get(), params.zero_init);
+      reset_index++;
     }
-
-    shuf_idx.Write(s.data(), num_programs);
-
-    RUN((num_programs + 2 * kNumThreads - 1) / (2 * kNumThreads), kNumThreads,
-        MutateAndRunPrograms<Language>, programs.Get(), shuf_idx.Get(),
-        seed(epoch), params.mutation_prob, insn_count.Get(), num_programs,
-        num_indices);
-    num_runs += num_indices;
 
     if (epoch % params.callback_interval == 0) {
       auto stop = std::chrono::high_resolution_clock::now();
@@ -538,7 +618,8 @@ void Simulation<Language>::RunSimulation(
       state.total_ops = total_ops;
       state.mops_s = mops_s;
       state.epoch = epoch + 1;
-      state.ops_per_run = insn * 1.0 / num_runs;
+      state.ops_per_run =
+          num_runs ? insn * 1.0 / num_runs : 0.0;
       state.brotli_size = brotli_size;
       state.brotli_bpb = brotli_bpb;
       state.bytes_per_prog = brotli_size * 1.0 / num_programs;
@@ -587,7 +668,7 @@ void Simulation<Language>::RunSimulation(
       insn_count.Write(&zero, 1);
     }
 
-    if (params.reset_interval.has_value() &&
+    if (!params.reinit_each_epoch && params.reset_interval.has_value() &&
         epoch % *params.reset_interval == 0) {
       RUN(num_programs / kNumThreads, kNumThreads, InitPrograms<Language>,
           seed(reset_index), num_programs, programs.Get(), params.zero_init);

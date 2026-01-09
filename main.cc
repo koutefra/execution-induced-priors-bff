@@ -14,6 +14,7 @@
 
 #include <assert.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -24,6 +25,65 @@
 #include <vector>
 
 #include "common.h"
+
+namespace {
+
+std::string BytesToHex(const uint8_t *data, size_t len) {
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+  std::string out(len * 2, '0');
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t byte = data[i];
+    out[i * 2] = kHexDigits[byte >> 4];
+    out[i * 2 + 1] = kHexDigits[byte & 0xf];
+  }
+  return out;
+}
+
+std::string JsonArray(const std::vector<std::string> &values) {
+  std::string out;
+  out.push_back('[');
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out.push_back(',');
+    }
+    out.push_back('"');
+    out.append(values[i]);
+    out.push_back('"');
+  }
+  out.push_back(']');
+  return out;
+}
+
+std::string JsonArray(const std::vector<size_t> &values) {
+  std::string out;
+  out.push_back('[');
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out.push_back(',');
+    }
+    out.append(std::to_string(values[i]));
+  }
+  out.push_back(']');
+  return out;
+}
+
+std::string CsvEscape(const std::string &value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char c : value) {
+    if (c == '"') {
+      out.push_back('"');
+      out.push_back('"');
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+constexpr size_t kMaxLoggedSelfreps = 5;
+
+}  // namespace
 
 namespace flags {
 class BaseFlag {
@@ -199,8 +259,17 @@ FLAG(bool, permute_programs, true,
      "do not shuffle programs between runs (cyclic interactions)");
 FLAG(bool, fixed_shuffle, false, "deterministic shuffling pattern");
 FLAG(bool, zero_init, false, "zero init");
+FLAG(bool, random_partner_interaction, false,
+     "interact with a fresh random program every epoch instead of another "
+     "soup program");
 FLAG(bool, eval_selfrep, false, "evaluate self replication in every epoch");
+FLAG(bool, reinit_each_epoch, false,
+     "reinitialize every program each epoch instead of letting them interact");
+FLAG(bool, print_selfrep, false,
+     "print any program whose self-replication score crosses the threshold");
 FLAG(size_t, print_interval, 64, "interval between prints");
+FLAG(std::optional<size_t>, log_interval, std::nullopt,
+     "interval between log entries and evaluations");
 FLAG(size_t, save_interval, 256, "interval between saves");
 FLAG(size_t, clear_interval, 2048, "interval between clears");
 FLAG(std::string, draw_to, "",
@@ -228,6 +297,10 @@ int main(int argc, char **argv) {
   params.fixed_shuffle = GetFlag(FLAGS_fixed_shuffle);
   params.zero_init = GetFlag(FLAGS_zero_init);
   params.eval_selfrep = GetFlag(FLAGS_eval_selfrep);
+  params.reinit_each_epoch = GetFlag(FLAGS_reinit_each_epoch);
+  params.print_selfrep = GetFlag(FLAGS_print_selfrep);
+  params.random_partner_interaction =
+      GetFlag(FLAGS_random_partner_interaction);
   params.save_to = GetFlag(FLAGS_checkpoint_dir);
   params.save_interval = GetFlag(FLAGS_save_interval);
   if (params.fixed_shuffle &&
@@ -238,6 +311,16 @@ int main(int argc, char **argv) {
   std::string interaction_pattern = GetFlag(FLAGS_interaction_pattern);
   if (params.fixed_shuffle && !interaction_pattern.empty()) {
     fprintf(stderr, "fixed shuffle and interaction pattern are incompatible\n");
+    return 1;
+  }
+  if (params.random_partner_interaction && !interaction_pattern.empty()) {
+    fprintf(stderr,
+            "random partner interaction does not use interaction patterns\n");
+    return 1;
+  }
+  if (params.random_partner_interaction && params.reinit_each_epoch) {
+    fprintf(stderr,
+            "random partner interaction cannot be combined with reinit_each_epoch\n");
     return 1;
   }
 
@@ -277,6 +360,7 @@ int main(int argc, char **argv) {
   }
   static_assert(kSingleTapeSize == 64, "fix drawing if tapes are not 64 bytes");
   std::vector<uint8_t> draw_buf_2d(params.num_programs * 3 * kSingleTapeSize);
+  std::vector<size_t> previous_selfrep_score(params.num_programs, 0);
 
   if (!interaction_pattern.empty()) {
     FILE *f = fopen(interaction_pattern.c_str(), "r");
@@ -299,29 +383,48 @@ int main(int argc, char **argv) {
   }
 
   std::optional<std::string> log_to = GetFlag(FLAGS_log);
-  uint32_t print_interval = GetFlag(FLAGS_print_interval);
-  uint32_t clear_interval = GetFlag(FLAGS_clear_interval);
+  size_t print_interval = GetFlag(FLAGS_print_interval);
+  size_t log_interval = GetFlag(FLAGS_log_interval).value_or(print_interval);
+  size_t clear_interval = GetFlag(FLAGS_clear_interval);
   std::optional<size_t> max_epochs = GetFlag(FLAGS_max_epochs);
   std::optional<size_t> stopping_bpb = GetFlag(FLAGS_stopping_bpb);
   std::optional<size_t> stopping_selfrep_count =
       GetFlag(FLAGS_stopping_selfrep_count);
+  bool disable_output = GetFlag(FLAGS_disable_output);
+
+  if (log_interval == 0) {
+    fprintf(stderr, "log interval must be greater than zero\n");
+    return 1;
+  }
+  if (print_interval == 0) {
+    fprintf(stderr, "print interval must be greater than zero\n");
+    return 1;
+  }
+  if (clear_interval == 0) {
+    fprintf(stderr, "clear interval must be greater than zero\n");
+    return 1;
+  }
 
   if (stopping_selfrep_count.has_value() && !params.eval_selfrep) {
     fprintf(stderr, "stopping_selfrep_count requires eval_selfrep\n");
     return 1;
   }
-
-  if (params.save_interval % print_interval != 0) {
-    fprintf(stderr, "save interval must be divisible by print interval\n");
+  if (params.print_selfrep && !params.eval_selfrep) {
+    fprintf(stderr, "print_selfrep requires eval_selfrep\n");
     return 1;
   }
 
-  if (clear_interval % print_interval != 0) {
-    fprintf(stderr, "clear interval must be divisible by print interval\n");
+  if (params.save_interval % log_interval != 0) {
+    fprintf(stderr, "save interval must be divisible by log interval\n");
     return 1;
   }
 
-  params.callback_interval = print_interval;
+  if (clear_interval % log_interval != 0) {
+    fprintf(stderr, "clear interval must be divisible by log interval\n");
+    return 1;
+  }
+
+  params.callback_interval = log_interval;
 
   auto run_flag = GetFlag(FLAGS_run);
   auto lang = GetFlag(FLAGS_lang);
@@ -336,7 +439,8 @@ int main(int argc, char **argv) {
       logfile = CheckFopen(log_to->c_str(), "w");
       if (params.eval_selfrep) {
         fprintf(logfile,
-                "epoch,brotli_size,soup_size,higher_entropy,number_selfreps\n");
+                "epoch,brotli_size,soup_size,higher_entropy,number_selfreps,"
+                "selfrep_tapes,selfrep_scores\n");
       } else {
         fprintf(logfile, "epoch,brotli_size,soup_size,higher_entropy\n");
       }
@@ -349,7 +453,25 @@ int main(int argc, char **argv) {
           repl_count++;
         }
       }
-      if (!GetFlag(FLAGS_disable_output)) {
+      // if (params.eval_selfrep && params.print_selfrep && !disable_output) {
+      //   for (size_t i = 0; i < state.replication_per_prog.size(); ++i) {
+      //     size_t current_score = state.replication_per_prog[i];
+      //     bool crossed_threshold =
+      //         previous_selfrep_score[i] < kSelfrepThreshold &&
+      //         current_score >= kSelfrepThreshold;
+      //     previous_selfrep_score[i] = current_score;
+      //     if (!crossed_threshold) continue;
+      //     printf(
+      //         "%sDetected self-replicator candidate at epoch %zu program %zu "
+      //         "score=%zu\n",
+      //         ResetColors(), state.epoch, i, current_score);
+      //     language->PrintProgram(kSingleTapeSize,
+      //                            state.soup.data() + i * kSingleTapeSize,
+      //                            kSingleTapeSize, nullptr, 0);
+      //   }
+      // }
+      bool should_print = !disable_output && state.epoch % print_interval == 0;
+      if (should_print) {
         if (state.epoch % clear_interval == 1) {
           printf("%s\033[2J\033[H", ResetColors());
         }
@@ -390,9 +512,41 @@ int main(int argc, char **argv) {
 
       if (logfile) {
         if (params.eval_selfrep) {
-          fprintf(logfile, "%zu,%zu,%zu,%f,%d\n", state.epoch,
+          std::vector<std::pair<size_t, size_t>> best_selfreps;
+          best_selfreps.reserve(kMaxLoggedSelfreps);
+          for (size_t i = 0; i < state.replication_per_prog.size(); ++i) {
+            size_t score = state.replication_per_prog[i];
+            if (score < kSelfrepThreshold) {
+              continue;
+            }
+            auto it = best_selfreps.begin();
+            while (it != best_selfreps.end() &&
+                   (it->second > score ||
+                    (it->second == score && it->first <= i))) {
+              ++it;
+            }
+            best_selfreps.insert(it, {i, score});
+            if (best_selfreps.size() > kMaxLoggedSelfreps) {
+              best_selfreps.pop_back();
+            }
+          }
+          std::vector<std::string> best_tapes;
+          std::vector<size_t> best_scores;
+          best_tapes.reserve(best_selfreps.size());
+          best_scores.reserve(best_selfreps.size());
+          for (const auto &[idx, score] : best_selfreps) {
+            best_scores.push_back(score);
+            best_tapes.emplace_back(
+                BytesToHex(state.soup.data() + idx * kSingleTapeSize,
+                           kSingleTapeSize));
+          }
+          std::string tapes_field = JsonArray(best_tapes);
+          std::string scores_field = JsonArray(best_scores);
+          fprintf(logfile, "%zu,%zu,%zu,%f,%d,\"%s\",\"%s\"\n", state.epoch,
                   state.brotli_size, state.soup.size() / kSingleTapeSize,
-                  state.higher_entropy, repl_count);
+                  state.higher_entropy, repl_count,
+                  CsvEscape(tapes_field).c_str(),
+                  CsvEscape(scores_field).c_str());
         } else {
           fprintf(logfile, "%zu,%zu,%zu,%f\n", state.epoch, state.brotli_size,
                   state.soup.size() / kSingleTapeSize, state.higher_entropy);

@@ -40,6 +40,7 @@ endif
 LANGS=$(patsubst %.cu,build/%.o,$(wildcard *.cu))
 
 PYEXT=$(shell python3-config --extension-suffix)
+TEST_BINS=bin/random_partner_test
 
 ifeq (${PYTHON}, 0)
 .PHONY:
@@ -47,6 +48,9 @@ all: bin/main
 else
 all: bin/main bin/cubff${PYEXT}
 endif
+
+.PHONY: tests
+tests: ${TEST_BINS}
 
 bin/main: build/main.o build/common.o ${LANGS}
 	${COMPILER} $^ ${FLAGS} ${LINK_FLAGS} -o $@
@@ -62,6 +66,9 @@ build/cubff_py.o: cubff_py.cc common.h
 
 bin/cubff${PYEXT}: build/cubff_py.o build/common.o ${LANGS}
 	${COMPILER} -shared $^ ${FLAGS} ${LINK_FLAGS} -o $@
+
+bin/random_partner_test: build/random_partner_test.o
+	${COMPILER} $^ ${FLAGS} ${LINK_FLAGS} -o $@
 
 .PHONY:
 clean:
